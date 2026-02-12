@@ -17,12 +17,8 @@ const argv = yargs(process.argv.slice(2))
   .option("dry-run", { type: "boolean", default: false })
   .option("budget", { type: "number", default: 100 })
   .option("copy-percentage", { type: "number", default: 0.25 })
-  .option("max-trade-size", { type: "number", default: 10 })
+  .option("max-trade-size", { type: "number", default: 10 }) // USDC cap
   .parseSync();
-
-/* ------------------------------------------------ */
-/* Mode Banner                                      */
-/* ------------------------------------------------ */
 
 console.log(
   argv["dry-run"]
@@ -32,12 +28,7 @@ console.log(
     : "⚠️ No mode selected"
 );
 
-/* ------------------------------------------------ */
-/* Utilities                                        */
-/* ------------------------------------------------ */
-
-const sleep = (ms: number) =>
-  new Promise(res => setTimeout(res, ms));
+const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
 
 async function retry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
   for (let i = 0; i < attempts; i++) {
@@ -51,10 +42,21 @@ async function retry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
 }
 
 /* ------------------------------------------------ */
-/* API Helpers                                      */
+/* API                                              */
 /* ------------------------------------------------ */
 
-async function fetchTrades(user: string) {
+type Trade = {
+  asset: string;
+  conditionId: string;
+  outcomeIndex: number;
+  price: number;
+  size: number;
+  side: string;
+  timestamp: number;
+  transactionHash: string;
+};
+
+async function fetchTrades(user: string): Promise<Trade[]> {
   const res = await axios.get(`${CONFIG.API_BASE}/trades`, {
     params: { user, limit: 50, takerOnly: true },
   });
@@ -62,43 +64,59 @@ async function fetchTrades(user: string) {
   return res.data;
 }
 
+async function fetchMarketsByConditionIds(conditionIds: string[]) {
+  if (conditionIds.length === 0) return [];
+
+  const res = await axios.get(
+    "https://gamma-api.polymarket.com/markets",
+    {
+      params: {},
+      paramsSerializer: () =>
+        conditionIds.map(id => `condition_ids=${id}`).join("&"),
+    }
+  );
+
+  return res.data;
+}
+
 /* ------------------------------------------------ */
-/* DRY RUN SIMULATION ENGINE                        */
+/* Simulation State                                */
 /* ------------------------------------------------ */
 
-type SimState = {
-  budgetRemaining: number;
-  spend: number;
+type Position = {
+  tokenID: string;
+  conditionId: string;
+  outcomeIndex: number;
+  shares: number;
+  cost: number;
 };
 
-const simState: SimState = {
+const simState = {
   budgetRemaining: argv.budget,
   spend: 0,
 };
 
+const positions = new Map<string, Position>();
 const report: any[] = [];
 
-async function simulateTrade(trade: any) {
-  const originalNotional = trade.size * trade.price;
-  const desired = originalNotional * argv["copy-percentage"];
+/* ------------------------------------------------ */
+/* Trade Simulation                                 */
+/* ------------------------------------------------ */
 
-  const copiedNotional = Math.min(
-    desired,
-    argv["max-trade-size"],
-    simState.budgetRemaining
-  );
+async function simulateTrade(trade: Trade) {
+  const shares = Number(trade.size);
+  const price = Number(trade.price);
+  const tokenID = String(trade.asset);
+
+  if (!Number.isFinite(shares) || !Number.isFinite(price)) return;
 
   const entry: any = {
     txHash: trade.transactionHash,
+    tokenID,
     conditionId: trade.conditionId,
-    outcome: trade.outcome,
-    price: trade.price,
-    size: trade.size,
-    originalNotional,
-    desiredNotional: desired,
-    copiedNotional,
-    budgetBefore: simState.budgetRemaining,
-    budgetAfter: simState.budgetRemaining - copiedNotional,
+    outcomeIndex: trade.outcomeIndex,
+    price,
+    shares,
   };
 
   if (trade.side !== "BUY") {
@@ -107,28 +125,125 @@ async function simulateTrade(trade: any) {
     return;
   }
 
-  if (copiedNotional <= 0) {
+  const desiredShares = shares * argv["copy-percentage"];
+
+  const maxSharesByUSDC = argv["max-trade-size"] / price;
+  const maxSharesByBudget = simState.budgetRemaining / price;
+
+  const copiedShares = Math.min(
+    desiredShares,
+    maxSharesByUSDC,
+    maxSharesByBudget
+  );
+
+  const cost = copiedShares * price;
+
+  entry.copiedShares = copiedShares;
+  entry.cost = cost;
+
+  if (copiedShares <= 0 || cost <= 0) {
     entry.skipped = "budget_exhausted";
     report.push(entry);
     return;
   }
 
-  simState.budgetRemaining -= copiedNotional;
-  simState.spend += copiedNotional;
+  simState.budgetRemaining -= cost;
+  simState.spend += cost;
+
+  const existing = positions.get(tokenID);
+
+  if (existing) {
+    existing.shares += copiedShares;
+    existing.cost += cost;
+  } else {
+    positions.set(tokenID, {
+      tokenID,
+      conditionId: trade.conditionId,
+      outcomeIndex: trade.outcomeIndex,
+      shares: copiedShares,
+      cost,
+    });
+  }
 
   report.push(entry);
 }
+
+/* ------------------------------------------------ */
+/* ✅ ONLY CHANGE IS HERE (PnL pricing fix)         */
+/* ------------------------------------------------ */
+
+async function computePnL() {
+  let totalCost = 0;
+  let totalValue = 0;
+
+  const breakdown = [];
+
+  const conditionIds = [
+    ...new Set([...positions.values()].map(p => p.conditionId)),
+  ];
+
+  const markets = await fetchMarketsByConditionIds(conditionIds);
+
+  const marketMap = new Map<string, any>();
+  for (const m of markets) {
+    marketMap.set(m.conditionId, m);
+  }
+
+  for (const pos of positions.values()) {
+    const market = marketMap.get(pos.conditionId);
+    if (!market) continue;
+
+    const outcomePrices = JSON.parse(market.outcomePrices);
+
+    /* ✅ Correct mark-to-market valuation */
+    const price =
+      Number(market.bestBid) ||
+      Number(market.lastTradePrice) ||
+      Number(outcomePrices[pos.outcomeIndex]);
+
+    console.log("markPrice", price);
+
+    if (!Number.isFinite(price)) continue;
+
+    const value = pos.shares * price;
+    const pnl = value - pos.cost;
+
+    totalCost += pos.cost;
+    totalValue += value;
+
+    breakdown.push({
+      tokenID: pos.tokenID,
+      question: market.question,
+      shares: pos.shares,
+      avgEntry: pos.cost / pos.shares,
+      marketPrice: price,
+      positionValue: value,
+      pnl,
+    });
+  }
+
+  return {
+    totalCost,
+    totalValue,
+    unrealizedPnL: totalValue - totalCost,
+    positions: breakdown,
+  };
+}
+
+/* ------------------------------------------------ */
 
 async function runDrySimulation(traderAddress: string) {
   const trades = await fetchTrades(traderAddress);
 
   const sorted = trades.sort(
-    (a: any, b: any) => a.timestamp - b.timestamp
+    (a, b) => a.timestamp - b.timestamp
   );
 
   for (const trade of sorted) {
     await simulateTrade(trade);
   }
+
+  const pnl = await computePnL();
 
   console.log("\n📊 SIMULATION RESULT\n");
 
@@ -138,6 +253,7 @@ async function runDrySimulation(traderAddress: string) {
       simulatedSpend: simState.spend,
       budgetRemaining: simState.budgetRemaining,
       tradesEvaluated: report.length,
+      pnl,
     },
     trades: report,
   }, null, 2));
