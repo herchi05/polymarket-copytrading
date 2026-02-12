@@ -1,0 +1,35 @@
+{
+  "name": "copy-trading-polymarket",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/herchi05/copy-trading-polymarket.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/herchi05/copy-trading-polymarket/issues"
+  },
+  "homepage": "https://github.com/herchi05/copy-trading-polymarket#readme",
+  "dependencies": {
+    "@polymarket/builder-relayer-client": "^0.0.8",
+    "@polymarket/clob-client": "^5.2.1",
+    "axios": "^1.13.5",
+    "better-sqlite3": "^12.6.2",
+    "dotenv": "^17.2.4",
+    "yargs": "^18.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.2.3",
+    "@types/yargs": "^17.0.35",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
